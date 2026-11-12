@@ -8,7 +8,7 @@ st.title("Partage de frais")
 with ouvrir_base() as conn:
     groupes = conn.execute("SELECT id, nom, date_debut, date_fin FROM groupes").fetchall()
     membres = conn.execute("SELECT id, nom, groupe_id FROM membres").fetchall()
-    depenses = conn.execute("SELECT id, groupe_id, libelle, montant_centimes, payeur_id, date FROM depenses").fetchall()
+    depenses = conn.execute("SELECT id, groupe_id, libelle, type_depense, montant_centimes, payeur_id, date FROM depenses").fetchall()
     participants = conn.execute("SELECT depense_id, membre_id FROM participants").fetchall()
 
 # --- 1.5 CALCUL DES SOLDES ---
@@ -75,20 +75,41 @@ st.divider()
 st.header("Ajouter / Assigner un membre")
 
 nom_nouveau_membre = st.text_input("Nom du nouveau membre")
+nom_groupe_creation = st.selectbox("Assigner au groupe", [g["nom"] for g in groupes], key="creation_membre")
 if st.button("Créer le membre") and nom_nouveau_membre:
+    groupe_id_cible = next(g["id"] for g in groupes if g["nom"] == nom_groupe_creation)
     with ouvrir_base() as conn:
-        conn.execute("INSERT INTO membres (groupe_id, nom) VALUES (1, ?)", [nom_nouveau_membre])
-    st.rerun()
+        nom_membre_ok = True
+        for membre in membres:
+            if nom_nouveau_membre == membre["nom"]:
+                if groupe_id_cible == membre["groupe_id"]:
+                    nom_membre_ok = False
+        if nom_membre_ok == False:
+            st.error("Erreur : deux membres du groupe ne peuvent pas avoir le même nom")
+        else:
+            conn.execute("INSERT INTO membres (groupe_id, nom) VALUES (?, ?)", [groupe_id_cible, nom_nouveau_membre])
+    if nom_membre_ok:
+        st.rerun()
 
 if membres and groupes:
     nom = st.selectbox("Sélectionner un membre à assigner", [m["nom"] for m in membres])
     nom_groupe_cible = st.selectbox("Sélectionner le groupe", [g["nom"] for g in groupes])
-    
+
     if st.button("Assigner au groupe"):
+        nom_membre_ok = True
         groupe_id_cible = next(g["id"] for g in groupes if g["nom"] == nom_groupe_cible)
+        for membre in membres:
+            if nom == membre["nom"]:
+                if groupe_id_cible == membre["groupe_id"]:
+                    nom_membre_ok = False
         with ouvrir_base() as conn:
-            conn.execute("UPDATE membres SET groupe_id = ? WHERE nom = ?", [groupe_id_cible, nom])
-        st.rerun()
+            if nom_membre_ok == False:
+                st.error("Erreur : deux membres du groupe ne peuvent pas avoir le même nom")
+            else:
+                conn.execute("UPDATE membres SET groupe_id = ? WHERE nom = ?", [groupe_id_cible, nom])
+            
+        if nom_membre_ok:
+            st.rerun()
 
 st.divider()
 
@@ -96,7 +117,7 @@ st.divider()
 st.header("Dépenses")
 
 for depense in depenses:
-    st.write(f"{depense['libelle']} - {depense['montant_centimes']/100:.2f} €")
+    st.write(f"{depense['libelle']} - {depense['montant_centimes']/100:.2f} € - Type :{depense['type_depense']}")
     if st.button("Supprimer", key=f"dep_{depense['id']}"): 
         with ouvrir_base() as conn:
             conn.execute("DELETE FROM participants WHERE depense_id = ?", [depense["id"]])
@@ -106,6 +127,7 @@ for depense in depenses:
 st.subheader("Ajouter une dépense")
 if membres and groupes:
     nom_depense = st.text_input("Libellé de la dépense")
+    type_depense = st.text_input("Type de la dépense")
     montant_centimes = st.number_input("Montant (en centimes)", min_value=0, step=100)
     date_depense = st.date_input("Date de la dépense")
 
@@ -128,6 +150,8 @@ if membres and groupes:
         # Vérification 3 : Le libellé ne doit pas être vide
         elif not nom_depense:
             st.error("Veuillez entrer un libellé pour la dépense.")
+        elif not type_depense:
+            st.error("Veuillez entrer un type pour la dépense.")
         else:
             groupe_selectionne = next(g for g in groupes if g["id"] == grp_id)
             date_depense_str = str(date_depense)
@@ -141,8 +165,8 @@ if membres and groupes:
                 with ouvrir_base() as conn:
                     # Insérer la dépense et récupérer son ID
                     cursor = conn.execute(
-                        "INSERT INTO depenses (groupe_id, libelle, montant_centimes, payeur_id, date) VALUES (?, ?, ?, ?, ?)",
-                        [grp_id, nom_depense, montant_centimes, mem_id, date_depense_str]
+                        "INSERT INTO depenses (groupe_id, libelle, type_depense, montant_centimes, payeur_id, date) VALUES (?, ?, ?, ?, ?, ?)",
+                        [grp_id, nom_depense, type_depense, montant_centimes, mem_id, date_depense_str]
                     )
                     nouvelle_depense_id = cursor.lastrowid
                     
@@ -156,3 +180,55 @@ if membres and groupes:
                 st.rerun()
 else:
     st.info("Veuillez d'abord créer au moins un groupe et un membre pour ajouter une dépense.")
+
+## Remboursement entre membres
+st.divider()
+st.header("Remboursements")
+st.info("Un remboursement est enregistré comme une dépense du rembourseur vers le membre remboursé.")
+
+if membres and groupes:
+    # 1. Sélectionner le groupe pour le remboursement
+    nom_groupe_remb = st.selectbox("Groupe concerné par le remboursement", [g["nom"] for g in groupes], key="grp_remb")
+    grp_remb_id = next(g["id"] for g in groupes if g["nom"] == nom_groupe_remb)
+    membres_du_groupe_remb = [m for m in membres if m["groupe_id"] == grp_remb_id]
+
+    if len(membres_du_groupe_remb) >= 2:
+        # 2. Sélectionner qui rembourse et qui reçoit
+        col1, col2 = st.columns(2)
+        with col1:
+            nom_rembourseur = st.selectbox("Qui rembourse ? (Payeur)", [m["nom"] for m in membres_du_groupe_remb], key="rembourseur")
+        with col2:
+            # On empêche de se rembourser soi-même dans l'interface
+            options_receveurs = [m["nom"] for m in membres_du_groupe_remb if m["nom"] != nom_rembourseur]
+            nom_receveur = st.selectbox("Qui reçoit ? (Bénéficiaire)", options_receveurs, key="receveur")
+        
+        montant_remb_centimes = st.number_input("Montant à rembourser (en centimes)", min_value=0, step=100, key="montant_remb")
+        date_remb = st.date_input("Date du remboursement", key="date_remb")
+
+        if st.button("Enregistrer le remboursement"):
+            if montant_remb_centimes <= 0:
+                st.error("Le montant doit être strictement positif.")
+            else:
+                rembourseur_id = next(m["id"] for m in membres_du_groupe_remb if m["nom"] == nom_rembourseur)
+                receveur_id = next(m["id"] for m in membres_du_groupe_remb if m["nom"] == nom_receveur)
+                libelle_remb = f"Remboursement de {nom_rembourseur} à {nom_receveur}"
+                
+                with ouvrir_base() as conn:
+                    # Enregistrer le remboursement comme une dépense payée par le rembourseur
+                    cursor = conn.execute(
+                        "INSERT INTO depenses (groupe_id, libelle, type_depense, montant_centimes, payeur_id, date) VALUES (?, ?, ?, ?, ?, ?)",
+                        [grp_remb_id, libelle_remb, "Remboursement", montant_remb_centimes, rembourseur_id, str(date_remb)]
+                    )
+                    nouvelle_depense_id = cursor.lastrowid
+                    
+                    # Le seul "participant" (celui qui a coûté l'argent à ce moment-là) est celui qui reçoit le remboursement
+                    conn.execute(
+                        "INSERT INTO participants (depense_id, membre_id) VALUES (?, ?)",
+                        [nouvelle_depense_id, receveur_id]
+                    )
+                st.success("Remboursement enregistré !")
+                st.rerun()
+    else:
+        st.warning("Il faut au moins deux membres dans ce groupe pour effectuer un remboursement.")
+else:
+    st.info("Veuillez d'abord créer au moins un groupe et des membres.")
